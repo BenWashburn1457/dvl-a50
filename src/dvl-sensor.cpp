@@ -6,9 +6,13 @@
  */
 
 #include "dvl_a50/dvl-sensor.hpp"
+#include <cerrno>
 
 namespace dvl_sensor {
 
+// How often to retry while disconnected. Also roughly bounds how long attempt_connect()
+// can block the executor on a single failed connect() (see Connect()'s timeout_ms below).
+static constexpr std::chrono::seconds RECONNECT_PERIOD{3};
 
 DVL_A50::DVL_A50():
 Node("dvl_a50_node")
@@ -20,8 +24,6 @@ Node("dvl_a50_node")
             qos_profile.history,
             qos_profile.depth),
             qos_profile);
-
-    timer_receive = this->create_wall_timer(std::chrono::milliseconds(50),std::bind(&DVL_A50::handle_receive, this));
 
     //Publishers
     dvl_pub_report = this->create_publisher<dvl_msgs::msg::DVL>("dvl/data", qos);
@@ -35,89 +37,106 @@ Node("dvl_a50_node")
     this->declare_parameter<std::string>("odom_frame_id", "dvl_odom_ned");
     this->declare_parameter<bool>("startup_disable_acoustics", false);
     this->declare_parameter<std::string>("startup_ntp_address", "");
-    
+
     dvl_frame_id = this->get_parameter("dvl_frame_id").as_string();
     odom_frame_id = this->get_parameter("odom_frame_id").as_string();
     ip_address = this->get_parameter("dvl_ip_address").as_string();
-    bool disable_acoustics = this->get_parameter("startup_disable_acoustics").as_bool();
+    disable_acoustics_on_startup_ = this->get_parameter("startup_disable_acoustics").as_bool();
+    startup_ntp_address_ = this->get_parameter("startup_ntp_address").as_string();
     RCLCPP_INFO(get_logger(), "IP_ADDRESS: '%s'", ip_address.c_str());
 
-    //--- TCP/IP SOCKET ---- 
-    tcpSocket = new TCPSocket((char*)ip_address.c_str() , 16171);
-    
-    if(tcpSocket->Create() < 0)
-        RCLCPP_ERROR(get_logger(), "Error creating the socket");
-   
-    tcpSocket->SetRcvTimeout(400);
-    std::string error;
-    
-    int error_code = 0;
-    //int fault = 1; 
-    
-    first_time = std::chrono::steady_clock::now();
-    first_time_error = first_time;
-    while(fault != 0)
-    {
-        fault = tcpSocket->Connect(5000, error, error_code);
-        if(error_code == 114)
-        {
-            RCLCPP_WARN(get_logger(), "Is the sensor on? error_code: %d", error_code);
-            usleep(2000000);
-            std::chrono::steady_clock::time_point current_time_error = std::chrono::steady_clock::now();
-    	    double dt = std::chrono::duration<double>(current_time_error - first_time_error).count();
-    	    if(dt >= 78.5) //Max time to set up
-    	    {
-    	        fault = -10;
-    	        break;
-    	    }
-        }
-        else if(error_code == 103)
-        {
-            RCLCPP_WARN(get_logger(), "No route to host, DVL might be booting?: error_code: %d", error_code);
-            usleep(2000000);
-        }
-    }  
-    
-    if(fault == -10)
-    {
-        tcpSocket->Close();
-        RCLCPP_ERROR(get_logger(), "Turn the sensor on and try again!");
-    }
-    else
-        RCLCPP_INFO(get_logger(), "DVL-A50 connected!");
-    
-    /*
-     * Disable transducer operation to limit sensor heating out of water.
-     */
-    if(disable_acoustics)
-    {
-        this->set_json_parameter("acoustic_enabled", "false");
-        RCLCPP_INFO(get_logger(), "Acoustic operation disabled on startup.");
-    }
-
-    std::string startup_ntp_address = this->get_parameter("startup_ntp_address").as_string();
-    if (!startup_ntp_address.empty()) {
-        json ntp_command = {
-            {"command", "set_time_ntp"},
-            {"parameters", {{"ntp_address", startup_ntp_address}}}
-        };
-        this->send_parameter_to_sensor(ntp_command);
-        RCLCPP_INFO(get_logger(), "Setting NTP address to: '%s'", startup_ntp_address.c_str());
-    }
-
-    usleep(2000);
-
+    // Make one attempt right away so a DVL that's already on connects immediately, without
+    // waiting for the first reconnect-timer tick.
+    attempt_connect();
+    timer_reconnect = this->create_wall_timer(RECONNECT_PERIOD, std::bind(&DVL_A50::attempt_connect, this));
+    timer_receive = this->create_wall_timer(std::chrono::milliseconds(50), std::bind(&DVL_A50::handle_receive, this));
 }
 
 DVL_A50::~DVL_A50() {
-    tcpSocket->Close();
+    if (tcpSocket)
+    {
+        tcpSocket->Close();
+        delete tcpSocket;
+    }
+}
+
+/*
+ * Makes one attempt to (re)connect to the DVL. Called once from the constructor and then
+ * repeatedly from timer_reconnect, so the node picks up the sensor whenever it actually
+ * becomes reachable - whether that's before or long after this node started - and recovers
+ * automatically if the connection later drops (see handle_receive()).
+ */
+void DVL_A50::attempt_connect()
+{
+    if (connection_state_ == ConnectionState::CONNECTED)
+        return;
+
+    // TCPSocket has no "reset" - its fd is dead after Close(), so a fresh instance is needed
+    // for each attempt. Deleting a null tcpSocket (first call) is a safe no-op.
     delete tcpSocket;
+    tcpSocket = new TCPSocket((char*)ip_address.c_str(), 16171);
+
+    if (tcpSocket->Create() < 0)
+    {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000, "Error creating the DVL socket, will keep retrying.");
+        return;
+    }
+
+    tcpSocket->SetRcvTimeout(400);
+
+    // Named connect_error_msg, not error, to avoid shadowing the public uint8_t error member.
+    std::string connect_error_msg;
+    int error_code = 0;
+    int result = tcpSocket->Connect(2000, connect_error_msg, error_code);
+
+    if (result != 0)
+    {
+        if (error_code == 114)
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000, "Is the DVL powered on? error_code: %d", error_code);
+        else if (error_code == 103)
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000, "No route to host, DVL might be booting or unplugged: error_code: %d", error_code);
+        else
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000, "DVL connect failed: %s (error_code: %d)", connect_error_msg.c_str(), error_code);
+
+        tcpSocket->Close();
+        return;
+    }
+
+    RCLCPP_INFO(get_logger(), "DVL-A50 connected!");
+    connection_state_ = ConnectionState::CONNECTED;
+    this->ready = 1;
+    this->error = 0;
+    on_connected();
+}
+
+/*
+ * Re-applies startup configuration on every successful (re)connect. The physical sensor
+ * resets to its own firmware defaults on power-cycle, so this can't just run once at node
+ * startup - it needs to run again every time the link comes back up.
+ */
+void DVL_A50::on_connected()
+{
+    if (disable_acoustics_on_startup_)
+    {
+        this->set_json_parameter("acoustic_enabled", "false");
+        RCLCPP_INFO(get_logger(), "Acoustic operation disabled on (re)connect.");
+    }
+
+    if (!startup_ntp_address_.empty())
+    {
+        json ntp_command = {
+            {"command", "set_time_ntp"},
+            {"parameters", {{"ntp_address", startup_ntp_address_}}}
+        };
+        this->send_parameter_to_sensor(ntp_command);
+        RCLCPP_INFO(get_logger(), "Setting NTP address to: '%s'", startup_ntp_address_.c_str());
+    }
 }
 
 
 void DVL_A50::handle_receive()
 {
-    if(fault != 0)
+    if(connection_state_ != ConnectionState::CONNECTED)
         return;
 
     char byte = 0;
@@ -129,6 +148,20 @@ void DVL_A50::handle_receive()
         str += byte;
         if (byte == '\n')
             break;
+    }
+
+    // n == 0 means the peer closed the connection; a negative n with an errno other than
+    // EAGAIN/EWOULDBLOCK/EINTR (the expected outcome of the 400ms recv timeout when the DVL
+    // simply has nothing new to send) means the socket is actually broken. Either way the
+    // link is gone - drop back to disconnected so timer_reconnect takes back over.
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+    {
+        RCLCPP_WARN(get_logger(), "Lost connection to the DVL - will attempt to reconnect.");
+        tcpSocket->Close();
+        connection_state_ = ConnectionState::DISCONNECTED;
+        this->ready = 0;
+        this->error = 1;
+        return;
     }
 
     // Skip parse if we got nothing or a partial message (e.g. socket timeout mid-stream)

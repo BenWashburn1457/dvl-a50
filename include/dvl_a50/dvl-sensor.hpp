@@ -46,10 +46,17 @@ enum DVL_Parameters {
     invalid_param
 };
 
+enum class ConnectionState {
+    DISCONNECTED,
+    CONNECTED
+};
+
 class DVL_A50: public rclcpp::Node
 {
 public:
 
+    // Mirrors connection_state_ for anything outside this class that wants to know DVL
+    // connectivity (e.g. diagnostics) without depending on ConnectionState directly.
     uint8_t ready = 0;
     uint8_t error = 0;
 
@@ -57,27 +64,33 @@ public:
     ~DVL_A50();
 
 private:
-    int fault = 1; 
+    ConnectionState connection_state_ = ConnectionState::DISCONNECTED;
     string delimiter = ",";
     std::string ip_address;
     std::string dvl_frame_id;
     std::string odom_frame_id;
-    TCPSocket *tcpSocket;
+    bool disable_acoustics_on_startup_ = false;
+    std::string startup_ntp_address_;
+    TCPSocket *tcpSocket = nullptr;
     json json_data;
 
     DVL_Parameters resolveParameter(std::string param);
-    
-    std::chrono::steady_clock::time_point first_time;
-    std::chrono::steady_clock::time_point first_time_error;
-    
+
     rclcpp::TimerBase::SharedPtr timer_receive;
-    rclcpp::TimerBase::SharedPtr timer_send;
+    rclcpp::TimerBase::SharedPtr timer_reconnect;
     rclcpp::Publisher<dvl_msgs::msg::DVL>::SharedPtr dvl_pub_report;
     rclcpp::Publisher<dvl_msgs::msg::DVLDR>::SharedPtr dvl_pub_pos;
     rclcpp::Publisher<dvl_msgs::msg::CommandResponse>::SharedPtr dvl_pub_command_response;
     rclcpp::Publisher<dvl_msgs::msg::ConfigStatus>::SharedPtr dvl_pub_config_status;
     rclcpp::Subscription<dvl_msgs::msg::ConfigCommand>::SharedPtr dvl_sub_config_command;
 
+    // Makes one non-blocking-ish attempt to (re)connect to the DVL. Safe to call whether
+    // currently connected or not - a no-op while already connected. Bound to timer_reconnect
+    // so it keeps retrying indefinitely whenever the sensor isn't reachable yet.
+    void attempt_connect();
+    // Re-applies startup configuration (acoustics/NTP) every time a connection is
+    // established, since power-cycling the physical sensor resets its firmware config too.
+    void on_connected();
 
     void handle_receive();
     //Publish velocity and transducer report
