@@ -24,6 +24,7 @@
 #include "dvl_msgs/msg/command_response.hpp"
 #include "dvl_msgs/msg/config_status.hpp"
 #include "dvl_msgs/msg/time_status.hpp"
+#include "std_msgs/msg/bool.hpp"
 
 #include "dvl_a50/json/single_include/nlohmann/json.hpp"
 #include <iomanip>
@@ -78,10 +79,12 @@ private:
 
     rclcpp::TimerBase::SharedPtr timer_receive;
     rclcpp::TimerBase::SharedPtr timer_reconnect;
+    rclcpp::TimerBase::SharedPtr timer_connected;
     rclcpp::Publisher<dvl_msgs::msg::DVL>::SharedPtr dvl_pub_report;
     rclcpp::Publisher<dvl_msgs::msg::DVLDR>::SharedPtr dvl_pub_pos;
     rclcpp::Publisher<dvl_msgs::msg::CommandResponse>::SharedPtr dvl_pub_command_response;
     rclcpp::Publisher<dvl_msgs::msg::ConfigStatus>::SharedPtr dvl_pub_config_status;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr dvl_pub_connected;
     rclcpp::Subscription<dvl_msgs::msg::ConfigCommand>::SharedPtr dvl_sub_config_command;
 
     // Makes one non-blocking-ish attempt to (re)connect to the DVL. Safe to call whether
@@ -91,6 +94,9 @@ private:
     // Re-applies startup configuration (acoustics/NTP) every time a connection is
     // established, since power-cycling the physical sensor resets its firmware config too.
     void on_connected();
+    // Publishes the TCP connection state on dvl/connected. Runs on a timer (not just on
+    // state changes) so subscribers can also detect this node itself going down.
+    void publish_connected();
 
     void handle_receive();
     //Publish velocity and transducer report

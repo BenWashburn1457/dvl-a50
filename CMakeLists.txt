@@ -57,6 +57,7 @@ set(node_plugins "${node_plugins}composition::LifecycleDVL;$<TARGET_FILE:dvl_a50
 
 add_executable(${PROJECT_NAME}_sensor src/dvl-sensor.cpp)
 ament_target_dependencies(${PROJECT_NAME}_sensor rclcpp 
+    "std_msgs"
     "sensor_msgs" 
     "geometry_msgs" 
     "dvl_msgs")

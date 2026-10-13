@@ -30,6 +30,8 @@ Node("dvl_a50_node")
     dvl_pub_pos = this->create_publisher<dvl_msgs::msg::DVLDR>("dvl/position", qos);
     dvl_pub_config_status = this->create_publisher<dvl_msgs::msg::ConfigStatus>("dvl/config/status", qos);
     dvl_pub_command_response = this->create_publisher<dvl_msgs::msg::CommandResponse>("dvl/command/response", qos);
+    // Reliable so it reaches both reliable and best-effort subscribers
+    dvl_pub_connected = this->create_publisher<std_msgs::msg::Bool>("dvl/connected", 10);
     dvl_sub_config_command = this->create_subscription<dvl_msgs::msg::ConfigCommand>("dvl/config/command", qos, std::bind(&DVL_A50::command_subscriber, this, _1));
 
     this->declare_parameter<std::string>("dvl_ip_address", "192.168.194.95");
@@ -50,6 +52,7 @@ Node("dvl_a50_node")
     attempt_connect();
     timer_reconnect = this->create_wall_timer(RECONNECT_PERIOD, std::bind(&DVL_A50::attempt_connect, this));
     timer_receive = this->create_wall_timer(std::chrono::milliseconds(50), std::bind(&DVL_A50::handle_receive, this));
+    timer_connected = this->create_wall_timer(std::chrono::seconds(1), std::bind(&DVL_A50::publish_connected, this));
 }
 
 DVL_A50::~DVL_A50() {
@@ -133,6 +136,12 @@ void DVL_A50::on_connected()
     }
 }
 
+void DVL_A50::publish_connected()
+{
+    std_msgs::msg::Bool msg;
+    msg.data = (connection_state_ == ConnectionState::CONNECTED);
+    dvl_pub_connected->publish(msg);
+}
 
 void DVL_A50::handle_receive()
 {
